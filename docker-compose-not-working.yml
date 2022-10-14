@@ -1,0 +1,277 @@
+#${CLUSTER_NAME} = fmhq
+#${ELASTIC_PASSWORD} = someCrazyDifficultPassword123
+#${KIBANA_PASSWORD} = someCrazyDifficultPassword123
+#${ES_PORT} = 9200
+#${KIBANA_PORT} = 5601
+#${LICENSE} = basic
+#${STACK_VERSION} = 8.4.3
+#${admin_username} = ad
+#${admin_password} = someOtherCrazyDifficultPassword321
+
+version: '3.8'
+
+services:
+  setup:
+    image: elasticsearch:${STACK_VERSION}
+    volumes:
+      - elk_certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 1m
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: 
+          - node.role == manager
+          - node.Hostname == fmhq041
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: es01\n"\
+          "    dns:\n"\
+          "      - es01\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: es02\n"\
+          "    dns:\n"\
+          "      - es02\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: es03\n"\
+          "    dns:\n"\
+          "      - es03\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions"
+        chown -R root:root config/certs;
+        find . -type d -exec chmod 750 \{\} \;;
+        find . -type f -exec chmod 640 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://es01:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "Setting admin user and password password";
+        curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es01:9200/_security/user/${admin_username}/ -d "{\"password\":\"${admin_password}\", \"roles\" : [ \"superuser\"], \"full_name\" : \"ad\", \"email\" : \"ad@example.com\"}";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es01:9200/_security/user/${admin_username}/_password -d "{\"password\":\"${admin_password}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/es01/es01.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+  es01:
+    image: elasticsearch:${STACK_VERSION}
+    depends_on:
+      - setup
+    restart: always
+    environment:
+      - node.name=es01
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es01
+      - discovery.seed_hosts=es02,es03
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es01/es01.key
+      - xpack.security.http.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es01/es01.key
+      - xpack.security.transport.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+      - path.repo=/opt/elasticsearch/backup
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elk_certs:/usr/share/elasticsearch/config/certs
+      - elk_es01_data:/usr/share/elasticsearch/data
+      - elk_backup_data:/opt/elasticsearch/backup
+    ports:
+      - ${ES_PORT}:9200
+    stop_grace_period: 2m
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 1m
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: 
+          - node.role == manager
+          - node.Hostname == fmhq041
+
+  es02:
+    image: elasticsearch:${STACK_VERSION}     
+    restart: always
+    environment:
+      - node.name=es02
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es01
+      - discovery.seed_hosts=es01,es03
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es02/es02.key
+      - xpack.security.http.ssl.certificate=certs/es02/es02.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es02/es02.key
+      - xpack.security.transport.ssl.certificate=certs/es02/es02.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+      - path.repo=/opt/elasticsearch/backup
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elk_certs:/usr/share/elasticsearch/config/certs
+      - elk_es02_data:/usr/share/elasticsearch/data
+      - elk_backup_data:/opt/elasticsearch/backup
+    stop_grace_period: 2m
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 1m
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: 
+          - node.role == manager
+          - node.Hostname == fmhq041
+
+  es03:
+    image: elasticsearch:${STACK_VERSION}
+    restart: always
+    environment:
+      - node.name=es03
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es01
+      - discovery.seed_hosts=es01,es02
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es03/es03.key
+      - xpack.security.http.ssl.certificate=certs/es03/es03.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es03/es03.key
+      - xpack.security.transport.ssl.certificate=certs/es03/es03.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+      - path.repo=/opt/elasticsearch/backup
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elk_certs:/usr/share/elasticsearch/config/certs
+      - elk_es03_data:/usr/share/elasticsearch/data
+      - elk_backup_data:/opt/elasticsearch/backup
+    stop_grace_period: 2m
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 1m
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: 
+          - node.role == manager
+          - node.Hostname == fmhq041
+
+  kibana:
+    image: kibana:${STACK_VERSION}
+    restart: always
+    environment:
+      - SERVERNAME=logging.flamemetals.com
+      - ELASTICSEARCH_HOSTS=https://es01:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    volumes:
+      - elk_certs:/usr/share/kibana/config/certs
+      - elk_kibana_data:/usr/share/kibana/data
+    ports:
+      - ${KIBANA_PORT}:5601
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 1m
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: 
+          - node.role == manager
+          - node.Hostname == fmhq041
+
+networks:
+  default:
+    external:
+      name: backend_network
+
+volumes:
+  elk_certs:
+    external:
+      name: elk_certs
+  elk_es01_data:
+    external:
+      name: elk_es01_data
+  elk_es02_data:
+    external:
+      name: elk_es02_data
+  elk_es03_data:
+    external:
+      name: elk_es03_data
+  elk_backup_data:
+    external:
+      name: elk_backup_data
+  elk_kibana_data:
+    external:
+      name: elk_kibana_data
